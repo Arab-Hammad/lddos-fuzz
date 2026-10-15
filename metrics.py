@@ -47,72 +47,52 @@ def measure_throughput(client_host, victim_ip, port, path="/"):
         return 0.0
 
 
-def _cpu_time_ns(victim_host, pid):
-    out = victim_host.cmd(f'cat /proc/{pid}/schedstat 2>/dev/null').strip()
-    if out:
-        try:
-            return int(out.split()[0])
-        except (IndexError, ValueError):
-            pass
-
-    out = victim_host.cmd(f'cat /proc/{pid}/stat 2>/dev/null').strip()
-    if not out:
-        return None
-    fields = out.split()
-    try:
-        return (int(fields[13]) + int(fields[14])) * 10_000_000
-    except (IndexError, ValueError):
-        return None
-
-
-def measure_resource_usage(victim_host, pid, during=None, sample_time=0.2):
+def measure_resource_usage_ps(victim_host, pid):
     if not pid:
         return 0.0, 0.0
 
-    t0 = _cpu_time_ns(victim_host, pid)
-    if t0 is None:
-        return 0.0, 0.0
+    out = victim_host.cmd(f'ps -o %cpu=,%mem= --pid {pid} 2>/dev/null').strip()
+    if not out:
+        out = victim_host.cmd(f'ps --ppid {pid} -o %cpu=,%mem= 2>/dev/null').strip()
 
-    start = time.time()
-    if during is not None:
-        during()
-    else:
-        time.sleep(sample_time)
-    elapsed = max(time.time() - start, 0.001)
-
-    t1 = _cpu_time_ns(victim_host, pid)
     cpu_pct = 0.0
-    if t1 is not None:
-        cpu_pct = ((t1 - t0) / 1e9) / elapsed * 100.0
-
     mem_kb = 0.0
+
+    try:
+        if out:
+            lines = out.split('\n')
+            total_cpu = 0.0
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 1:
+                    total_cpu += float(parts[0])
+            cpu_pct = round(total_cpu, 2)
+    except (ValueError, IndexError):
+        cpu_pct = 0.0
+
     status_out = victim_host.cmd(f'grep VmRSS /proc/{pid}/status 2>/dev/null').strip()
     if status_out:
         try:
             mem_kb = float(status_out.split()[1])
         except (IndexError, ValueError):
-            pass
+            mem_kb = 0.0
 
-    return round(cpu_pct, 2), mem_kb
+    return cpu_pct, mem_kb
 
 
 def collect_sample(client_host, victim_host, victim_ip, port, victim_pid, path="/", debug=False):
-    result = {}
-
-    def during():
-        result["service_up"], result["response_time_ms"] = check_service(
-            client_host, victim_ip, port, path, debug=debug
-        )
-        result["throughput_Bps"] = measure_throughput(client_host, victim_ip, port, path)
-
-    cpu_pct, memory_kb = measure_resource_usage(victim_host, victim_pid, during=during)
+    service_up, response_time_ms = check_service(client_host, victim_ip, port, path, debug=debug)
+    throughput_Bps = measure_throughput(client_host, victim_ip, port, path)
+    
+    cpu_pct, memory_kb = measure_resource_usage_ps(victim_host, victim_pid)
+    
     loss_pct = measure_loss(client_host, victim_ip)
 
     return {
-        "service_up": int(result.get("service_up", False)),
-        "response_time_ms": result.get("response_time_ms", 0.0),
+        "service_up": int(service_up),
+        "response_time_ms": response_time_ms,
         "loss_pct": loss_pct,
-        "throughput_Bps": round(result.get("throughput_Bps", 0.0), 2),
+        "throughput_Bps": round(throughput_Bps, 2),
         "cpu_pct": cpu_pct,
         "memory_kb": memory_kb,
     }
